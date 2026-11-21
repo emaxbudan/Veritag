@@ -96,6 +96,32 @@ export interface PasskeyWalletRecord {
   createdAt: string;
 }
 
+export interface ProvenanceEdgeRecord {
+  id: string;
+  unitId: string;
+  fromNode: string;
+  toNode: string;
+  transitionType: string;
+  txHash: string;
+  blockTime: string;
+}
+
+export interface ProvenanceGraph {
+  unitId: string;
+  nodes: Array<{ id: string; label: string }>;
+  edges: ProvenanceEdgeRecord[];
+}
+
+function buildProvenanceGraph(unitId: string, edges: ProvenanceEdgeRecord[]): ProvenanceGraph {
+  const nodeIds = new Set<string>();
+  for (const edge of edges) {
+    if (edge.fromNode) nodeIds.add(edge.fromNode);
+    if (edge.toNode) nodeIds.add(edge.toNode);
+  }
+  const nodes = [...nodeIds].map((id) => ({ id, label: id }));
+  return { unitId, nodes, edges };
+}
+
 export interface Repository {
   upsertBrand(brand: BrandRecord): Promise<void>;
   getBrand(address: string): Promise<BrandRecord | null>;
@@ -140,6 +166,8 @@ export interface Repository {
   upsertPasskeyWallet(wallet: PasskeyWalletRecord): Promise<void>;
   getPasskeyWallet(credentialId: string): Promise<PasskeyWalletRecord | null>;
   getPasskeyWalletByAddress(walletAddress: string): Promise<PasskeyWalletRecord | null>;
+
+  getProvenanceGraph(unitId: string): Promise<ProvenanceGraph>;
 }
 
 export class InMemoryRepository implements Repository {
@@ -154,6 +182,7 @@ export class InMemoryRepository implements Repository {
   protected readonly files = new Map<string, FileMetadataRecord>();
   protected readonly scans = new Map<string, number>();
   protected readonly passkeyWallets = new Map<string, PasskeyWalletRecord>();
+  protected readonly provenanceEdges = new Map<string, ProvenanceEdgeRecord>();
 
   async upsertBrand(brand: BrandRecord): Promise<void> {
     this.brands.set(brand.address, { ...brand });
@@ -278,6 +307,40 @@ export class InMemoryRepository implements Repository {
 
   async appendEvent(event: UnitEventRecord): Promise<void> {
     this.events.set(event.id, { ...event });
+    if (event.unitId) {
+      if (event.type === "unit_activated") {
+        this.provenanceEdges.set(`${event.id}:UnitActivated`, {
+          id: `${event.id}:UnitActivated`,
+          unitId: event.unitId,
+          fromNode: String(event.data.brand ?? event.brand ?? ""),
+          toNode: String(event.data.owner ?? ""),
+          transitionType: "UnitActivated",
+          txHash: event.txHash,
+          blockTime: event.createdAt,
+        });
+      } else if (event.type === "unit_transferred") {
+        this.provenanceEdges.set(`${event.id}:UnitTransferred`, {
+          id: `${event.id}:UnitTransferred`,
+          unitId: event.unitId,
+          fromNode: String(event.data.from ?? ""),
+          toNode: String(event.data.to ?? ""),
+          transitionType: "UnitTransferred",
+          txHash: event.txHash,
+          blockTime: event.createdAt,
+        });
+      } else if (event.type === "claim_resolved" && event.data.outcome === "Replaced") {
+        const unit = this.units.get(event.unitId);
+        this.provenanceEdges.set(`${event.id}:UnitRetired`, {
+          id: `${event.id}:UnitRetired`,
+          unitId: event.unitId,
+          fromNode: unit?.owner ?? "",
+          toNode: "RETIRED",
+          transitionType: "UnitRetired",
+          txHash: event.txHash,
+          blockTime: event.createdAt,
+        });
+      }
+    }
   }
 
   async getUnitEvents(unitId: string): Promise<UnitEventRecord[]> {
@@ -339,6 +402,13 @@ export class InMemoryRepository implements Repository {
       }
     }
     return null;
+  }
+
+  async getProvenanceGraph(unitId: string): Promise<ProvenanceGraph> {
+    const edges = [...this.provenanceEdges.values()]
+      .filter((e) => e.unitId === unitId)
+      .sort((a, b) => a.blockTime.localeCompare(b.blockTime) || a.id.localeCompare(b.id));
+    return buildProvenanceGraph(unitId, edges);
   }
 }
 
@@ -1016,5 +1086,25 @@ export class PostgresRepository implements Repository {
       deployed: Boolean(row.deployed),
       createdAt: new Date(String(row.created_at)).toISOString(),
     };
+  }
+
+  async getProvenanceGraph(unitId: string): Promise<ProvenanceGraph> {
+    const res = await this.pool.query(
+      `SELECT id, unit_id, from_node, to_node, transition_type, tx_hash, block_time
+       FROM unit_provenance_edges
+       WHERE unit_id = $1
+       ORDER BY block_time ASC, id ASC`,
+      [unitId],
+    );
+    const edges: ProvenanceEdgeRecord[] = res.rows.map((row) => ({
+      id: String(row.id),
+      unitId: String(row.unit_id),
+      fromNode: String(row.from_node),
+      toNode: String(row.to_node),
+      transitionType: String(row.transition_type),
+      txHash: String(row.tx_hash),
+      blockTime: new Date(String(row.block_time)).toISOString(),
+    }));
+    return buildProvenanceGraph(unitId, edges);
   }
 }

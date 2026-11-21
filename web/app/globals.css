@@ -3,5 +3,55 @@
 @tailwind utilities;
 
 body {
-  @apply bg-slate-50 text-slate-900 antialiased;
+  @apply bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100;
+}
+
+/* ─── Print media: hide everything except the sticker sheet ─────────────────── */
+@media print {
+  /* Hide all chrome */
+  header,
+  footer,
+  nav,
+  .no-print {
+    display: none !important;
+  }
+
+  /* Full-bleed page */
+  html,
+  body {
+    background: white !important;
+    margin: 0;
+    padding: 0;
+  }
+
+  /* Hide all direct body children except our print root */
+  body > *:not(#veritag-print-root) {
+    display: none !important;
+  }
+
+  /* Show and reset the print root */
+  #veritag-print-root {
+    display: block !important;
+    position: static !important;
+    width: 100%;
+  }
+
+  /* Clean page break between sheets */
+  .print-sheet {
+    page-break-after: always;
+    break-after: page;
+  }
+
+  /* Individual label: never break mid-label */
+  .print-label {
+    page-break-inside: avoid;
+    break-inside: avoid;
+    border: 0.5pt solid #cbd5e1;
+  }
+
+  /* Strip interactive buttons and download links from labels */
+  button,
+  a[download] {
+    display: none !important;
+  }
 }

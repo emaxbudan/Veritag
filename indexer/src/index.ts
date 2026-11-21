@@ -1,22 +1,57 @@
+import { AlertService } from "./alerts.js";
 import { IndexerPoller, RpcEventsProvider } from "./poller.js";
 import { InMemoryIndexerWriter, PostgresIndexerWriter } from "./writer.js";
 
 const rpcUrl = process.env.SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org";
-const contractId =
+const registryContractId =
   process.env.REGISTRY_CONTRACT_ID ?? "CCOY35YSS7ICXGYOSZOF4QXZP5OG2MFSEFXZUYJEFUUXG5HHZ3ZUZQND";
+const accountFactoryContractId = process.env.ACCOUNT_FACTORY_CONTRACT_ID;
+const passkeyAccountContractIds = (process.env.PASSKEY_ACCOUNT_CONTRACT_IDS ?? "")
+  .split(",")
+  .map((id) => id.trim())
+  .filter(Boolean);
+const extraContractIds = (process.env.INDEXER_CONTRACT_IDS ?? "")
+  .split(",")
+  .map((id) => id.trim())
+  .filter(Boolean);
+
+const contractKinds: Record<string, ContractKind> = {
+  [registryContractId]: "registry",
+};
+if (accountFactoryContractId) {
+  contractKinds[accountFactoryContractId] = "account_factory";
+}
+for (const id of passkeyAccountContractIds) {
+  contractKinds[id] = "passkey_account";
+}
+
+const contractIds = Array.from(
+  new Set([
+    registryContractId,
+    ...(accountFactoryContractId ? [accountFactoryContractId] : []),
+    ...passkeyAccountContractIds,
+    ...extraContractIds,
+  ]),
+);
+
 const databaseUrl =
   process.env.DATABASE_URL ?? "postgres://veritag:veritag@localhost:5432/veritag";
 const pollIntervalMs = Number(process.env.INDEXER_POLL_INTERVAL_MS ?? 5000);
 const confirmationLedgers = Number(process.env.INDEXER_CONFIRMATION_LEDGERS ?? 2);
+const healthPort = Number(process.env.INDEXER_HEALTH_PORT ?? process.env.PORT ?? 8080);
+const maxAllowedLag = Number(process.env.MAX_ALLOWED_LAG ?? 50);
+
+const alertService = new AlertService();
 
 const writer =
   process.env.USE_IN_MEMORY_DB === "true"
-    ? new InMemoryIndexerWriter()
-    : new PostgresIndexerWriter(databaseUrl);
+    ? new InMemoryIndexerWriter(alertService)
+    : new PostgresIndexerWriter(databaseUrl, alertService);
 
 const provider = new RpcEventsProvider(rpcUrl);
 const poller = new IndexerPoller({
-  contractId,
+  contractIds,
+  contractKinds,
   provider,
   writer,
   confirmationLedgers,
@@ -36,6 +71,27 @@ export function parseCliArgs(argv: readonly string[]): {
   return { backfill, fromLedger, toLedger };
 }
 
+/**
+ * Creates a lightweight HTTP server exposing `GET /healthz` for container liveness/readiness checks.
+ */
+export function createHealthServer(
+  targetPoller: IndexerPoller,
+  maxLag = maxAllowedLag,
+): Server {
+  return createServer((req, res) => {
+    const urlPath = (req.url ?? "/").split("?")[0];
+    if (req.method === "GET" && urlPath === "/healthz") {
+      const health = targetPoller.getHealthStatus(maxLag);
+      const statusCode = health.status === "healthy" ? 200 : 503;
+      res.writeHead(statusCode, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: health.status, lag: health.lag }));
+      return;
+    }
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not found" }));
+  });
+}
+
 async function main(): Promise<void> {
   const args = parseCliArgs(process.argv.slice(2));
   if (args.backfill) {
@@ -44,7 +100,7 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     console.log(
-      `[indexer] Running backfill for ${contractId} from ledger ${args.fromLedger} to ${args.toLedger}...`,
+      `[indexer] Running backfill for ${contractIds.join(", ")} from ledger ${args.fromLedger} to ${args.toLedger}...`,
     );
     const summary = await poller.backfillRange(args.fromLedger, args.toLedger);
     console.log(
@@ -52,6 +108,11 @@ async function main(): Promise<void> {
     );
     return;
   }
+
+  const healthServer = createHealthServer(poller, maxAllowedLag);
+  healthServer.listen(healthPort, () => {
+    console.log(`[indexer] Healthcheck listening on :${healthPort}/healthz (MAX_ALLOWED_LAG=${maxAllowedLag})`);
+  });
 
   console.log(`Veritag indexer started for contract ${contractId} via ${rpcUrl}`);
   while (true) {

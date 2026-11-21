@@ -1,7 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { MetricCardSkeleton } from "@/components/MetricCardSkeleton";
 import { QrCodeCard } from "@/components/QrCodeCard";
+import { TableSkeleton } from "@/components/TableSkeleton";
 import { PUBLIC_CONFIG } from "@/lib/stellar";
 import { useWallet } from "@/lib/wallet-context";
 
@@ -15,14 +17,6 @@ interface BrandBatchSummary {
   recalled: boolean;
 }
 
-interface PrintableTagRow {
-  unitId: string;
-  serial: string;
-  scratchSecret: string;
-  qrUrl: string;
-  qrSvg?: string;
-}
-
 export default function BrandDashboardPage() {
   const { session, connectRoleKeypair, connectFreighter, signContractAction } = useWallet();
   const [domain, setDomain] = useState("chronos-watches.swiss");
@@ -30,6 +24,7 @@ export default function BrandDashboardPage() {
   const [serviceCenterInput, setServiceCenterInput] = useState("");
   const [authorizedCenters, setAuthorizedCenters] = useState<string[]>([]);
   const [exportedLabels, setExportedLabels] = useState<PrintableTagRow[]>([]);
+  const [printPreviewOpen, setPrintPreviewOpen] = useState(false);
 
   const [batches, setBatches] = useState<BrandBatchSummary[]>([
     {
@@ -48,8 +43,10 @@ export default function BrandDashboardPage() {
   const [warrantyMonths, setWarrantyMonths] = useState(24);
   const [productSku, setProductSku] = useState("Chronos Diver 300M");
   const [notice, setNotice] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
 
   const loadBrandState = useCallback(async (token: string) => {
+    setIsLoading(true);
     try {
       const [meRes, batchesRes] = await Promise.all([
         fetch(`${PUBLIC_CONFIG.apiUrl}/v1/brands/me`, {
@@ -96,6 +93,8 @@ export default function BrandDashboardPage() {
       }
     } catch {
       // Keep preview state when offline
+    } finally {
+      setIsLoading(false);
     }
   }, []);
 
@@ -269,6 +268,54 @@ export default function BrandDashboardPage() {
     );
   }
 
+  async function handleCsvWizardCommit(payload: BatchCommitPayload) {
+    const enc = new TextEncoder();
+    const batchDigest = await crypto.subtle.digest("SHA-256", enc.encode(payload.batchCode));
+    const batchId = Array.from(new Uint8Array(batchDigest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+    if (session?.token) {
+      try {
+        const signedTxXdr = await signContractAction("commit_batch");
+        await fetch(`${PUBLIC_CONFIG.apiUrl}/v1/brands/batches`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${session.token}`,
+          },
+          body: JSON.stringify({
+            batchCode: payload.batchCode,
+            warrantyMonths: payload.warrantyMonths,
+            productMeta: { model: productSku, domain },
+            count: payload.units.length,
+            merkleRoot: payload.merkleRoot,
+            ...(signedTxXdr ? { signedTxXdr } : {}),
+          }),
+        });
+      } catch {
+        // Offline fallback
+      }
+    }
+
+    setBatches((prev) => [
+      {
+        batchCode: payload.batchCode,
+        batchId,
+        merkleRoot: payload.merkleRoot,
+        unitCount: payload.units.length,
+        activatedCount: 0,
+        warrantyMonths: payload.warrantyMonths,
+        recalled: false,
+      },
+      ...prev,
+    ]);
+    setVisualizedLeaves(payload.units.slice(0, 64).map((u) => ({ label: u.serial })));
+    setNotice(
+      `Committed CSV batch ${payload.batchCode} (${payload.units.length} units, root ${payload.merkleRoot.slice(0, 14)}...).`,
+    );
+  }
+
   async function handleExportBatch(batchId: string, purge: boolean) {
     if (session?.token) {
       try {
@@ -331,6 +378,7 @@ export default function BrandDashboardPage() {
   }
 
   return (
+    <>
     <div className="mx-auto max-w-6xl px-4 py-10 space-y-8 sm:px-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
@@ -377,13 +425,22 @@ export default function BrandDashboardPage() {
             <h2 className="text-base font-bold text-slate-900">
               Printable Packaging QR &amp; Scratch-Off Labels
             </h2>
-            <button
-              type="button"
-              onClick={() => setExportedLabels([])}
-              className="text-xs font-semibold text-slate-500 hover:text-slate-800"
-            >
-              Close Preview
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setPrintPreviewOpen(true)}
+                className="rounded-xl bg-slate-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-slate-800"
+              >
+                Open Print Preview
+              </button>
+              <button
+                type="button"
+                onClick={() => setExportedLabels([])}
+                className="text-xs font-semibold text-slate-500 hover:text-slate-800"
+              >
+                Close Preview
+              </button>
+            </div>
           </div>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {exportedLabels.map((item) => (
@@ -525,7 +582,13 @@ export default function BrandDashboardPage() {
         </div>
 
         <div className="lg:col-span-8 space-y-4">
-          {batches.map((b) => (
+          {isLoading ? (
+            <>
+              <MetricCardSkeleton count={3} />
+              <TableSkeleton rows={3} columns={4} />
+            </>
+          ) : (
+            batches.map((b) => (
             <div
               key={b.batchId}
               className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm space-y-4"
@@ -590,9 +653,17 @@ export default function BrandDashboardPage() {
                 )}
               </div>
             </div>
-          ))}
+          ))
+          )}
         </div>
       </div>
     </div>
+    {printPreviewOpen && (
+      <QrPrintPreviewModal
+        items={exportedLabels}
+        onClose={() => setPrintPreviewOpen(false)}
+      />
+    )}
+    </>
   );
 }

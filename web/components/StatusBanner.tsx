@@ -1,3 +1,7 @@
+"use client";
+
+import confetti from "canvas-confetti";
+import { useEffect } from "react";
 import type { VerificationStatus } from "@/lib/stellar";
 
 const STATUS_META: Record<
@@ -47,8 +51,8 @@ const STATUS_META: Record<
     title: "Product Recall Active",
     description:
       "The manufacturer has issued an on-chain recall for this production batch. Do not use or resell this item.",
-    classes: "border-red-400 bg-red-50 text-red-950",
-    dotClasses: "bg-red-600",
+    classes: "border-red-500 bg-red-50 text-red-950 ring-2 ring-red-500/60 animate-pulse",
+    dotClasses: "bg-red-600 animate-ping",
   },
   Retired: {
     badge: "Retired · Replaced Under Warranty",
@@ -68,16 +72,75 @@ const STATUS_META: Record<
   },
 };
 
-export function StatusBanner({ status }: { status: VerificationStatus }) {
+/**
+ * Determines whether the celebratory confetti shower should fire for a verified product.
+ */
+export function shouldTriggerConfetti(
+  status: VerificationStatus,
+  isFirstActivation: boolean,
+  prefersReducedMotion: boolean,
+): boolean {
+  if (prefersReducedMotion) return false;
+  return isFirstActivation && (status === "AuthenticInactive" || status === "AuthenticActive");
+}
+
+export interface StatusBannerProps {
+  status: VerificationStatus;
+  isFirstActivation?: boolean;
+}
+
+export function StatusBanner({
+  status,
+  isFirstActivation = status === "AuthenticInactive",
+}: StatusBannerProps) {
   const meta = STATUS_META[status];
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const prefersReducedMotion =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    if (!shouldTriggerConfetti(status, isFirstActivation, prefersReducedMotion)) {
+      return;
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.setAttribute("aria-hidden", "true");
+    canvas.style.position = "fixed";
+    canvas.style.inset = "0";
+    canvas.style.width = "100%";
+    canvas.style.height = "100%";
+    canvas.style.pointerEvents = "none";
+    canvas.style.zIndex = "50";
+    document.body.appendChild(canvas);
+
+    const fire = confetti.create(canvas, { resize: true, useWorker: false });
+    void fire({
+      particleCount: 80,
+      spread: 70,
+      origin: { y: 0.6 },
+      disableForReducedMotion: true,
+    });
+
+    return () => {
+      fire.reset();
+      canvas.remove();
+    };
+  }, [status, isFirstActivation]);
+
   return (
-    <section className={`rounded-2xl border p-6 shadow-sm ${meta.classes}`}>
+    <section
+      role={status === "Recalled" ? "alert" : undefined}
+      className={`rounded-2xl border p-6 shadow-sm ${meta.classes}`}
+    >
       <div className="inline-flex items-center gap-2 rounded-full bg-white/80 px-3 py-1 text-xs font-semibold uppercase tracking-wider shadow-sm">
-        <span className={`h-2.5 w-2.5 rounded-full ${meta.dotClasses}`} />
+        <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${meta.dotClasses}`} />
         {meta.badge}
       </div>
-      <h1 className="mt-3 text-2xl font-bold tracking-tight sm:text-3xl">{meta.title}</h1>
-      <p className="mt-2 text-sm leading-relaxed opacity-90 sm:text-base">{meta.description}</p>
+      <h1 className="mt-3 text-xl font-bold tracking-tight sm:text-3xl">{meta.title}</h1>
+      <p className="mt-2 text-sm leading-relaxed opacity-90">{meta.description}</p>
     </section>
   );
 }

@@ -51,16 +51,16 @@ export default function HomePage() {
   }
 
   return (
-    <div className="mx-auto max-w-6xl px-4 py-12 sm:px-6">
-      <div className="grid gap-10 lg:grid-cols-12 lg:items-start">
-        <div className="lg:col-span-7 space-y-6">
-          <div className="inline-flex items-center gap-2 rounded-full border border-blue-200 bg-blue-50 px-3.5 py-1 text-xs font-semibold text-blue-700">
+    <div className="mx-auto max-w-6xl px-3 py-8 sm:px-6 sm:py-12">
+      <div className="grid gap-8 lg:grid-cols-12 lg:items-start">
+        <div className="lg:col-span-7 space-y-5 sm:space-y-6">
+          <div className="inline-flex items-center gap-2 rounded-full border border-blue-200 bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">
             Merkle Batch Commits · Lazy Soroban Activation · Passkey Wallets
           </div>
-          <h1 className="text-4xl font-extrabold tracking-tight text-slate-900 sm:text-5xl">
+          <h1 className="text-3xl font-extrabold tracking-tight text-slate-900 sm:text-5xl">
             Know what you&apos;re buying. Prove what you own.
           </h1>
-          <p className="text-lg leading-relaxed text-slate-600">
+          <p className="text-base leading-relaxed text-slate-600 sm:text-lg">
             Veritag anchors entire production batches to Stellar Soroban in a single Merkle root,
             defeats QR cloning with hidden scratch-off secrets, and turns product warranties into
             transferable records that follow resale.
@@ -89,9 +89,9 @@ export default function HomePage() {
         <div className="lg:col-span-5">
           <form
             onSubmit={handleSubmit}
-            className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm space-y-4"
+            className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm space-y-4 sm:p-6"
           >
-            <h2 className="text-lg font-bold text-slate-900">Verify a Product Tag</h2>
+            <h2 className="text-base font-bold text-slate-900 sm:text-lg">Verify a Product Tag</h2>
             <p className="text-xs text-slate-500">
               Scan a Veritag QR code on your phone or inspect any serial number directly against
               Soroban.
@@ -105,8 +105,11 @@ export default function HomePage() {
                 type="text"
                 value={brand}
                 onChange={(e) => setBrand(e.target.value)}
-                className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 font-mono text-xs"
+                className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 font-mono text-xs break-all"
               />
+              <p className="mt-0.5 truncate font-mono text-[10px] text-slate-400">
+                {brand.slice(0, 6)}...{brand.slice(-4)}
+              </p>
             </div>
 
             <div>

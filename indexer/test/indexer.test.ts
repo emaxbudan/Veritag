@@ -1,9 +1,10 @@
 import { Address, Keypair, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { sha256 } from "@veritag/sdk";
 import type pg from "pg";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { AlertService } from "../src/alerts.js";
 import { decodeRegistryEvent, type RawSorobanEvent } from "../src/decoder.js";
-import { parseCliArgs } from "../src/index.js";
+import { createHealthServer, parseCliArgs } from "../src/index.js";
 import { IndexerPoller, type SorobanEventsProvider } from "../src/poller.js";
 import { InMemoryIndexerWriter, PostgresIndexerWriter } from "../src/writer.js";
 
@@ -272,5 +273,379 @@ describe("@veritag/indexer XDR decoder, poller, and idempotent writer", () => {
     const duplicateDecoded = decodeRegistryEvent(rawPage1[0]!)!;
     const dupRes = await pgWriter.applyEvent(duplicateDecoded, true);
     expect(dupRes.applied).toBe(false);
+  });
+
+  it("materializes provenance edges across activation, multiple transfers, and retirement", async () => {
+    const brand = Keypair.random().publicKey();
+    const distributor = Keypair.random().publicKey();
+    const retailer = Keypair.random().publicKey();
+    const consumer = Keypair.random().publicKey();
+    const batchId = sha256("BATCH-PROV-01");
+    const unitId = sha256("UNIT-PROV-01");
+    const reportHash = sha256("REPORT-PROV-01");
+
+    const rawEvents: RawSorobanEvent[] = [
+      {
+        id: "000200-1",
+        ledger: 200,
+        txHash: "tx-act",
+        ledgerClosedAt: "2026-01-01T00:00:00.000Z",
+        topic: [scSym("unit_activated"), scBytes32(unitId)],
+        value: scMap([
+          ["brand", scAddr(brand)],
+          ["batch_id", scBytes32(batchId)],
+          ["owner", scAddr(distributor)],
+          ["warranty_expiry", nativeToScVal(1_900_000_000n, { type: "u64" })],
+        ]),
+      },
+      {
+        id: "000201-1",
+        ledger: 201,
+        txHash: "tx-xfer-1",
+        ledgerClosedAt: "2026-01-02T00:00:00.000Z",
+        topic: [scSym("unit_transferred"), scBytes32(unitId)],
+        value: scMap([
+          ["from", scAddr(distributor)],
+          ["to", scAddr(retailer)],
+        ]),
+      },
+      {
+        id: "000202-1",
+        ledger: 202,
+        txHash: "tx-xfer-2",
+        ledgerClosedAt: "2026-01-03T00:00:00.000Z",
+        topic: [scSym("unit_transferred"), scBytes32(unitId)],
+        value: scMap([
+          ["from", scAddr(retailer)],
+          ["to", scAddr(consumer)],
+        ]),
+      },
+      {
+        id: "000203-1",
+        ledger: 203,
+        txHash: "tx-retire",
+        ledgerClosedAt: "2026-01-04T00:00:00.000Z",
+        topic: [scSym("claim_resolved"), scBytes32(unitId)],
+        value: scMap([
+          ["claim_id", nativeToScVal(1, { type: "u32" })],
+          ["outcome", nativeToScVal(4, { type: "u32" })], // Replaced = 4 -> Retired
+          ["report_hash", scBytes32(reportHash)],
+        ]),
+      },
+    ];
+
+    const writer = new InMemoryIndexerWriter();
+    for (const raw of rawEvents) {
+      const decoded = decodeRegistryEvent(raw)!;
+      await writer.applyEvent(decoded, true);
+    }
+
+    const unitHex = unitId.toString("hex");
+    const unitEdges = writer.provenanceEdges.filter((e) => e.unitId === unitHex);
+    expect(unitEdges).toHaveLength(4);
+    expect(unitEdges.map((e) => [e.fromNode, e.toNode, e.transitionType])).toEqual([
+      [brand, distributor, "UnitActivated"],
+      [distributor, retailer, "UnitTransferred"],
+      [retailer, consumer, "UnitTransferred"],
+      [consumer, "RETIRED", "UnitRetired"],
+    ]);
+
+    const executedSql: string[] = [];
+    const mockClient = {
+      query: async (sql: string) => {
+        executedSql.push(sql.trim());
+        return { rowCount: 1, rows: [{ id: "ok" }] };
+      },
+      release: () => {},
+    };
+    const mockPool = {
+      connect: async () => mockClient,
+      query: async () => ({ rowCount: 0, rows: [] }),
+      end: async () => {},
+    } as unknown as pg.Pool;
+
+    const pgWriter = new PostgresIndexerWriter(mockPool);
+    for (const raw of rawEvents) {
+      await pgWriter.applyEvent(decodeRegistryEvent(raw)!, true);
+    }
+    expect(
+      executedSql.filter((s) => s.includes("INSERT INTO unit_provenance_edges")).length,
+    ).toBe(4);
+  });
+
+  it("reports healthy or lagging status via IndexerPoller and /healthz HTTP server", async () => {
+    const writer = new InMemoryIndexerWriter();
+    let shouldFail = false;
+    const provider: SorobanEventsProvider = {
+      async fetchEvents() {
+        if (shouldFail) {
+          throw new Error("RPC connection stalled");
+        }
+        return { latestLedger: 500, cursor: "c-500", events: [] };
+      },
+    };
+    const poller = new IndexerPoller({
+      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+      provider,
+      writer,
+    });
+
+    await poller.pollOnce();
+    expect(poller.getHealthStatus(50)).toEqual({
+      status: "healthy",
+      lag: 0,
+      latestLedger: 500,
+      currentLedger: 500,
+    });
+
+    shouldFail = true;
+    await expect(poller.pollOnce()).rejects.toThrow("RPC connection stalled");
+    expect(poller.getHealthStatus(50).status).toBe("lagging");
+
+    const server = createHealthServer(poller, 50);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    try {
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as { status: string; lag: number };
+      expect(body.status).toBe("lagging");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+describe("@veritag/indexer AlertService webhook dispatcher", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("dispatches BatchRecalled alerts to Discord and Slack with formatted markdown", async () => {
+    const discordUrl = "https://discord.example/webhook";
+    const slackUrl = "https://slack.example/webhook";
+    const contractId = "CCONTRACT123";
+
+    const alerts = new AlertService({
+      discordUrl,
+      slackUrl,
+      contractId,
+      network: "testnet",
+    });
+
+    const event = {
+      type: "batch_recalled" as const,
+      id: "alert-recall-001",
+      ledger: 500,
+      txHash: "tx-recall-hash-001",
+      createdAt: "2026-01-15T10:00:00Z",
+      brand: "GBRANDADDRESS001",
+      batchId: "batch-id-abc",
+      reasonHash: "reason-hash-abc",
+    };
+
+    await alerts.dispatchAlert(event, { brandDomain: "nordic-med.eu" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const discordCall = fetchMock.mock.calls[0]!;
+    expect(discordCall[0]).toBe(discordUrl);
+    const discordBody = JSON.parse(discordCall[1].body as string);
+    expect(discordBody.content).toContain("Batch Recalled");
+    expect(discordBody.content).toContain("nordic-med.eu");
+    expect(discordBody.content).toContain("batch-id-abc");
+    expect(discordBody.content).toContain("CCONTRACT123");
+    expect(discordBody.content).toContain("stellar.expert/explorer/testnet/tx/tx-recall-hash-001");
+
+    const slackCall = fetchMock.mock.calls[1]!;
+    expect(slackCall[0]).toBe(slackUrl);
+    const slackBody = JSON.parse(slackCall[1].body as string);
+    expect(slackBody.text).toContain("Batch Recalled");
+    expect(slackBody.text).toContain("nordic-med.eu");
+  });
+
+  it("dispatches UnitFlagged alerts with severity and contract ID", async () => {
+    const alerts = new AlertService({
+      discordUrl: "https://discord.example/webhook",
+      contractId: "CCONTRACT456",
+      network: "testnet",
+    });
+
+    const event = {
+      type: "unit_flagged" as const,
+      id: "alert-flag-001",
+      ledger: 501,
+      txHash: "tx-flag-hash-001",
+      createdAt: "2026-01-15T11:00:00Z",
+      unitId: "unit-id-xyz",
+      reasonHash: "flag-reason-hash",
+    };
+
+    await alerts.dispatchAlert(event, { brandDomain: "helvetia.ch" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const call = fetchMock.mock.calls[0]!;
+    const body = JSON.parse(call[1].body as string);
+    expect(body.content).toContain("Unit Flagged");
+    expect(body.content).toContain("helvetia.ch");
+    expect(body.content).toContain("unit-id-xyz");
+    expect(body.content).toContain("CCONTRACT456");
+    expect(body.content).toContain("stellar.expert/explorer/testnet/tx/tx-flag-hash-001");
+  });
+
+  it("handles webhook delivery failures gracefully without throwing", async () => {
+    fetchMock = vi.fn().mockRejectedValue(new Error("Connection refused"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const alerts = new AlertService({
+      discordUrl: "https://discord.example/webhook",
+      slackUrl: "https://slack.example/webhook",
+    });
+
+    const event = {
+      type: "batch_recalled" as const,
+      id: "alert-fail-001",
+      ledger: 600,
+      txHash: "tx-fail-001",
+      createdAt: "2026-01-15T12:00:00Z",
+      brand: "GBRAND002",
+      batchId: "batch-fail",
+      reasonHash: "reason-fail",
+    };
+
+    // Should not throw
+    await expect(alerts.dispatchAlert(event)).resolves.toBeUndefined();
+    expect(errorSpy).toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it("InMemoryIndexerWriter dispatches alerts when processing BatchRecalled and UnitFlagged events", async () => {
+    const brand = Keypair.random().publicKey();
+    const batchId = sha256("ALERT-BATCH-01").toString("hex");
+    const unitId = sha256("ALERT-UNIT-01").toString("hex");
+
+    const alerts = new AlertService({
+      discordUrl: "https://discord.example/webhook",
+      slackUrl: "https://slack.example/webhook",
+      contractId: "CCONTRACT789",
+      network: "testnet",
+    });
+
+    const writer = new InMemoryIndexerWriter(alerts);
+
+    // Register brand so the writer has domain context for alerts
+    await writer.applyEvent(
+      {
+        type: "brand_registered",
+        id: "brand-reg-01",
+        ledger: 100,
+        txHash: "tx-brand-reg",
+        createdAt: "2026-01-10T08:00:00Z",
+        brand,
+        domain: "chronos-watches.swiss",
+      },
+      true,
+    );
+
+    await writer.applyEvent(
+      {
+        type: "batch_committed",
+        id: "batch-com-01",
+        ledger: 101,
+        txHash: "tx-batch-com",
+        createdAt: "2026-01-10T09:00:00Z",
+        brand,
+        batchId,
+        root: sha256("ROOT").toString("hex"),
+        warrantyMonths: 24,
+        unitCount: 100,
+      },
+      true,
+    );
+
+    await writer.applyEvent(
+      {
+        type: "unit_activated",
+        id: "unit-act-01",
+        ledger: 102,
+        txHash: "tx-unit-act",
+        createdAt: "2026-01-10T10:00:00Z",
+        unitId,
+        brand,
+        batchId,
+        owner: Keypair.random().publicKey(),
+        warrantyExpiry: 1_900_000_000,
+      },
+      true,
+    );
+
+    fetchMock.mockClear();
+
+    // BatchRecalled → should trigger alert with brand domain
+    await writer.applyEvent(
+      {
+        type: "batch_recalled",
+        id: "batch-recall-01",
+        ledger: 103,
+        txHash: "tx-recall-final",
+        createdAt: "2026-01-15T10:00:00Z",
+        brand,
+        batchId,
+        reasonHash: "recall-reason-hash",
+      },
+      true,
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const recallBody = JSON.parse(fetchMock.mock.calls[0]![1].body as string);
+    expect(recallBody.content).toContain("chronos-watches.swiss");
+    expect(recallBody.content).toContain("Batch Recalled");
+
+    fetchMock.mockClear();
+
+    // UnitFlagged → should trigger alert with brand domain looked up from unit
+    await writer.applyEvent(
+      {
+        type: "unit_flagged",
+        id: "unit-flag-01",
+        ledger: 104,
+        txHash: "tx-flag-final",
+        createdAt: "2026-01-15T11:00:00Z",
+        unitId,
+        reasonHash: "flag-reason-hash",
+      },
+      true,
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const flagBody = JSON.parse(fetchMock.mock.calls[0]![1].body as string);
+    expect(flagBody.content).toContain("Unit Flagged");
+    expect(flagBody.content).toContain("chronos-watches.swiss");
+
+    // Duplicate event should NOT re-trigger alert (idempotent)
+    fetchMock.mockClear();
+    await writer.applyEvent(
+      {
+        type: "batch_recalled",
+        id: "batch-recall-01",
+        ledger: 103,
+        txHash: "tx-recall-final",
+        createdAt: "2026-01-15T10:00:00Z",
+        brand,
+        batchId,
+        reasonHash: "recall-reason-hash",
+      },
+      true,
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

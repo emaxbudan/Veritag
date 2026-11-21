@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { WarrantyCertificate } from "@/components/WarrantyCertificate";
 import { PUBLIC_CONFIG } from "@/lib/stellar";
 import { useWallet } from "@/lib/wallet-context";
 
@@ -11,6 +12,7 @@ interface OwnedProductItem {
   brandDomain: string;
   warrantyDaysRemaining: number;
   claimsUsed: number;
+  txHash?: string;
 }
 
 const INITIAL_PRODUCTS: OwnedProductItem[] = [
@@ -21,6 +23,7 @@ const INITIAL_PRODUCTS: OwnedProductItem[] = [
     brandDomain: "chronos-watches.swiss",
     warrantyDaysRemaining: 630,
     claimsUsed: 1,
+    txHash: "4e9b2f7a1c8d3065a2b4c6d8e0f123456789abcdef0123456789abcdef012345",
   },
 ];
 
@@ -28,12 +31,15 @@ export default function OwnerPortalPage() {
   const { session, connectPasskey, connectRoleKeypair, signContractAction } = useWallet();
   const [products, setProducts] = useState<OwnedProductItem[]>(INITIAL_PRODUCTS);
   const [transferCode, setTransferCode] = useState<string | null>(null);
+  const [transferExpiresAt, setTransferExpiresAt] = useState<number | null>(null);
   const [redeemUnitId, setRedeemUnitId] = useState("");
   const [redeemCode, setRedeemCode] = useState("");
   const [serviceCenterAddr, setServiceCenterAddr] = useState("");
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [selectedCertUnit, setSelectedCertUnit] = useState<OwnedProductItem | null>(null);
 
   const loadOwnerUnits = useCallback(async (address: string, token: string) => {
+    setIsLoading(true);
     try {
       const res = await fetch(`${PUBLIC_CONFIG.apiUrl}/v1/owners/${encodeURIComponent(address)}/units`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -63,6 +69,8 @@ export default function OwnerPortalPage() {
       }
     } catch {
       // Keep demo items when offline
+    } finally {
+      setIsLoading(false);
     }
   }, []);
 
@@ -101,6 +109,7 @@ export default function OwnerPortalPage() {
             sponsoredTxHash?: string;
           };
           setTransferCode(data.transferCode);
+          setTransferExpiresAt(Math.floor(Date.now() / 1000) + 86_400);
           setFeedback(
             `Signed & generated 24-hour one-time resale code anchored to your unit.${
               data.sponsoredTxHash ? ` [Tx: ${data.sponsoredTxHash.slice(0, 12)}...]` : ""
@@ -114,6 +123,7 @@ export default function OwnerPortalPage() {
     }
     const code = `XFER-${unitId.slice(0, 4).toUpperCase()}-${Math.floor(100000 + Math.random() * 900000)}`;
     setTransferCode(code);
+    setTransferExpiresAt(Math.floor(Date.now() / 1000) + 86_400);
     setFeedback(
       "Generated 24-hour one-time resale code. Share this with the buyer to transfer ownership and remaining warranty.",
     );
@@ -218,12 +228,18 @@ export default function OwnerPortalPage() {
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={() => void handleConnectPasskey()}
+            onClick={() => {
+              if (session) {
+                void handleConnectPasskey();
+              } else {
+                setPasskeyOnboardingOpen(true);
+              }
+            }}
             className="rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800"
           >
             {session
               ? `${session.label}: ${session.address.slice(0, 8)}...`
-              : "Sign in with Passkey (WebAuthn)"}
+              : "Create Passkey Wallet"}
           </button>
           {!session && (
             <button
@@ -245,7 +261,13 @@ export default function OwnerPortalPage() {
 
       <div className="grid gap-6 lg:grid-cols-3">
         <div className="lg:col-span-2 space-y-4">
-          {products.map((item) => (
+          {isLoading ? (
+            <>
+              <MetricCardSkeleton count={2} />
+              <TableSkeleton rows={3} columns={3} />
+            </>
+          ) : (
+            products.map((item) => (
             <div
               key={item.unitId}
               className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm space-y-4"
@@ -269,7 +291,14 @@ export default function OwnerPortalPage() {
                 >
                   Create Resale Transfer Code
                 </button>
-                <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setSelectedCertUnit(item)}
+                  className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-2.5 text-xs font-semibold text-amber-900 hover:bg-amber-100"
+                >
+                  Download Warranty Certificate
+                </button>
+                <div className="flex gap-2 sm:col-span-2">
                   <input
                     type="text"
                     placeholder="Service Center G..."
@@ -288,15 +317,15 @@ export default function OwnerPortalPage() {
               </div>
 
               {transferCode && (
-                <div className="rounded-xl bg-slate-900 p-4 text-white">
-                  <div className="text-xs text-slate-400">One-Time Resale Transfer Code</div>
-                  <div className="mt-1 font-mono text-lg font-bold tracking-wider text-emerald-400">
-                    {transferCode}
-                  </div>
-                </div>
+                <TransferCountdownCard
+                  transferCode={transferCode}
+                  expiresAt={transferExpiresAt ?? undefined}
+                  onExpired={() => setTransferCode(null)}
+                />
               )}
             </div>
-          ))}
+          ))
+          )}
         </div>
 
         <form
@@ -340,6 +369,29 @@ export default function OwnerPortalPage() {
           </button>
         </form>
       </div>
+
+      {selectedCertUnit && (
+        <WarrantyCertificate
+          data={{
+            unitId: selectedCertUnit.unitId,
+            model: selectedCertUnit.model,
+            serial: selectedCertUnit.serial,
+            brandDomain: selectedCertUnit.brandDomain,
+            ownerAddress:
+              session?.address ?? "GB9M4...2P8W (Connect Passkey for full Stellar address)",
+            txHash: selectedCertUnit.txHash,
+            contractId: PUBLIC_CONFIG.contractId,
+            expiresAt: new Date(
+              Date.now() + selectedCertUnit.warrantyDaysRemaining * 86_400 * 1000,
+            )
+              .toISOString()
+              .slice(0, 10),
+            warrantyDaysRemaining: selectedCertUnit.warrantyDaysRemaining,
+            claimsUsed: selectedCertUnit.claimsUsed,
+          }}
+          onClose={() => setSelectedCertUnit(null)}
+        />
+      )}
     </div>
   );
 }

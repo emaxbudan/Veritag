@@ -19,7 +19,7 @@
     "contract:bindings": "./scripts/generate-bindings.sh",
     "db:migrate": "pnpm --filter @veritag/backend db:migrate",
     "seed:demo": "tsx scripts/seed-demo.ts",
-    "accounts:fund": "tsx scripts/fund-testnet-accounts.ts"
+    "test:load": "k6 run scripts/load-test.js"
   },
   "devDependencies": {
     "@types/node": "^22.13.0",

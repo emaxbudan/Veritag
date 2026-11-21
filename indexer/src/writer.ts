@@ -1,5 +1,6 @@
 import pg from "pg";
 import type { DecodedRegistryEvent } from "./decoder.js";
+import { AlertService, type AlertContext } from "./alerts.js";
 
 export interface IndexerCursorState {
   lastLedger: number;
@@ -9,18 +10,35 @@ export interface IndexerCursorState {
 export interface IndexerWriter {
   getCursor(streamId?: string): Promise<IndexerCursorState>;
   saveCursor(state: IndexerCursorState, streamId?: string): Promise<void>;
-  applyEvent(event: DecodedRegistryEvent, finalized: boolean): Promise<{ applied: boolean }>;
-  finalizeEventsUpTo(confirmedLedger: number): Promise<number>;
+  applyEvent(event: DecodedEvent, finalized: boolean): Promise<{ applied: boolean }>;
+  finalizeEventsUpTo(confirmedLedger: number, minLedger?: number): Promise<number>;
 }
 
 const DEFAULT_STREAM_ID = "soroban-registry";
+const DEFAULT_PARTITION_SIZE = 100_000;
+
+export interface ProvenanceEdge {
+  id: string;
+  unitId: string;
+  fromNode: string;
+  toNode: string;
+  transitionType: "UnitActivated" | "UnitTransferred" | "UnitRetired";
+  txHash: string;
+  blockTime: string;
+}
 
 export class InMemoryIndexerWriter implements IndexerWriter {
+  private readonly alerts?: AlertService;
   private readonly cursors = new Map<string, IndexerCursorState>();
+
+  constructor(alerts?: AlertService) {
+    this.alerts = alerts;
+  }
   public readonly events = new Map<
     string,
-    { event: DecodedRegistryEvent; finalized: boolean }
+    { event: DecodedEvent; finalized: boolean }
   >();
+  public readonly deployedAccounts = new Set<string>();
   public readonly brands = new Map<string, { domain: string; verified: boolean }>();
   public readonly batches = new Map<
     string,
@@ -42,6 +60,7 @@ export class InMemoryIndexerWriter implements IndexerWriter {
     string,
     { serviceCenter: string; outcome: string; reportHash: string }
   >();
+  public readonly provenanceEdges: ProvenanceEdge[] = [];
 
   async getCursor(streamId = DEFAULT_STREAM_ID): Promise<IndexerCursorState> {
     return this.cursors.get(streamId) ?? { lastLedger: 0, lastCursor: "" };
@@ -51,7 +70,7 @@ export class InMemoryIndexerWriter implements IndexerWriter {
     this.cursors.set(streamId, { ...state });
   }
 
-  async applyEvent(event: DecodedRegistryEvent, finalized: boolean): Promise<{ applied: boolean }> {
+  async applyEvent(event: DecodedEvent, finalized: boolean): Promise<{ applied: boolean }> {
     const existing = this.events.get(event.id);
     if (existing) {
       if (finalized && !existing.finalized) {
@@ -89,6 +108,15 @@ export class InMemoryIndexerWriter implements IndexerWriter {
           claimsUsed: 0,
           duplicateAttempts: 0,
         });
+        this.provenanceEdges.push({
+          id: `${event.id}:UnitActivated`,
+          unitId: event.unitId,
+          fromNode: event.brand,
+          toNode: event.owner,
+          transitionType: "UnitActivated",
+          txHash: event.txHash,
+          blockTime: event.createdAt,
+        });
         break;
       case "duplicate_attempt": {
         const u = this.units.get(event.unitId);
@@ -102,6 +130,15 @@ export class InMemoryIndexerWriter implements IndexerWriter {
         if (u) {
           this.units.set(event.unitId, { ...u, owner: event.to });
         }
+        this.provenanceEdges.push({
+          id: `${event.id}:UnitTransferred`,
+          unitId: event.unitId,
+          fromNode: event.from,
+          toNode: event.to,
+          transitionType: "UnitTransferred",
+          txHash: event.txHash,
+          blockTime: event.createdAt,
+        });
         break;
       }
       case "claim_filed": {
@@ -132,6 +169,15 @@ export class InMemoryIndexerWriter implements IndexerWriter {
           if (u) {
             this.units.set(event.unitId, { ...u, status: "Retired" });
           }
+          this.provenanceEdges.push({
+            id: `${event.id}:UnitRetired`,
+            unitId: event.unitId,
+            fromNode: u?.owner ?? "",
+            toNode: "RETIRED",
+            transitionType: "UnitRetired",
+            txHash: event.txHash,
+            blockTime: event.createdAt,
+          });
         }
         break;
       }
@@ -158,16 +204,42 @@ export class InMemoryIndexerWriter implements IndexerWriter {
       case "service_center_registered":
       case "transfer_offered":
       case "transfer_cancelled":
+      case "passkey_added":
+      case "passkey_removed":
+      case "passkey_rotated":
+      case "recovery_updated":
         break;
+      case "account_deployed":
+        this.deployedAccounts.add(event.account);
+        break;
+    }
+
+    if (this.alerts && (event.type === "batch_recalled" || event.type === "unit_flagged")) {
+      const ctx: AlertContext = {};
+      if (event.type === "batch_recalled") {
+        const brandInfo = this.brands.get(event.brand);
+        ctx.brandDomain = brandInfo?.domain;
+      } else if (event.type === "unit_flagged") {
+        const unit = this.units.get(event.unitId);
+        if (unit) {
+          const brandInfo = this.brands.get(unit.brand);
+          ctx.brandDomain = brandInfo?.domain;
+        }
+      }
+      await this.alerts.dispatchAlert(event, ctx);
     }
 
     return { applied: true };
   }
 
-  async finalizeEventsUpTo(confirmedLedger: number): Promise<number> {
+  async finalizeEventsUpTo(confirmedLedger: number, minLedger = 0): Promise<number> {
     let count = 0;
     for (const [id, entry] of this.events.entries()) {
-      if (!entry.finalized && entry.event.ledger <= confirmedLedger) {
+      if (
+        !entry.finalized &&
+        entry.event.ledger >= minLedger &&
+        entry.event.ledger <= confirmedLedger
+      ) {
         this.events.set(id, { ...entry, finalized: true });
         count++;
       }
@@ -178,12 +250,14 @@ export class InMemoryIndexerWriter implements IndexerWriter {
 
 export class PostgresIndexerWriter implements IndexerWriter {
   private readonly pool: pg.Pool;
+  private readonly alerts?: AlertService;
 
-  constructor(databaseUrlOrPool: string | pg.Pool) {
+  constructor(databaseUrlOrPool: string | pg.Pool, alerts?: AlertService) {
     this.pool =
       typeof databaseUrlOrPool === "string"
         ? new pg.Pool({ connectionString: databaseUrlOrPool })
         : databaseUrlOrPool;
+    this.alerts = alerts;
   }
 
   async close(): Promise<void> {
@@ -217,7 +291,7 @@ export class PostgresIndexerWriter implements IndexerWriter {
     );
   }
 
-  async applyEvent(event: DecodedRegistryEvent, finalized: boolean): Promise<{ applied: boolean }> {
+  async applyEvent(event: DecodedEvent, finalized: boolean): Promise<{ applied: boolean }> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -225,6 +299,23 @@ export class PostgresIndexerWriter implements IndexerWriter {
       const unitId = "unitId" in event ? event.unitId : null;
       const brand = "brand" in event ? event.brand : null;
       const batchId = "batchId" in event ? event.batchId : null;
+      const contractId = "contractId" in event ? (event.contractId ?? null) : null;
+
+      await client.query(
+        `INSERT INTO raw_events (id, contract_id, type, data, ledger, tx_hash, finalized, created_at)
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8)
+         ON CONFLICT (id, ledger) DO NOTHING`,
+        [
+          event.id,
+          contractId,
+          event.type,
+          JSON.stringify(event),
+          event.ledger,
+          event.txHash,
+          finalized,
+          event.createdAt,
+        ],
+      );
 
       const insertRes = await client.query(
         `INSERT INTO unit_events (id, unit_id, brand, batch_id, type, data, ledger, tx_hash, finalized, created_at)
@@ -248,6 +339,10 @@ export class PostgresIndexerWriter implements IndexerWriter {
       if (insertRes.rowCount === 0) {
         if (finalized) {
           await client.query(`UPDATE unit_events SET finalized = TRUE WHERE id = $1`, [event.id]);
+          await client.query(
+            `UPDATE raw_events SET finalized = TRUE WHERE id = $1 AND ledger = $2`,
+            [event.id, event.ledger],
+          );
         }
         await client.query("COMMIT");
         return { applied: false };
@@ -305,6 +400,19 @@ export class PostgresIndexerWriter implements IndexerWriter {
              SET owner = EXCLUDED.owner, warranty_expiry = EXCLUDED.warranty_expiry, updated_at = NOW()`,
             [event.unitId, event.brand, event.batchId, event.owner, tsSec, event.warrantyExpiry],
           );
+          await client.query(
+            `INSERT INTO unit_provenance_edges (id, unit_id, from_node, to_node, transition_type, tx_hash, block_time)
+             VALUES ($1, $2, $3, $4, 'UnitActivated', $5, $6)
+             ON CONFLICT (id) DO NOTHING`,
+            [
+              `${event.id}:UnitActivated`,
+              event.unitId,
+              event.brand,
+              event.owner,
+              event.txHash,
+              event.createdAt,
+            ],
+          );
           break;
         }
 
@@ -319,6 +427,19 @@ export class PostgresIndexerWriter implements IndexerWriter {
           await client.query(
             `UPDATE units SET owner = $2, updated_at = NOW() WHERE unit_id = $1`,
             [event.unitId, event.to],
+          );
+          await client.query(
+            `INSERT INTO unit_provenance_edges (id, unit_id, from_node, to_node, transition_type, tx_hash, block_time)
+             VALUES ($1, $2, $3, $4, 'UnitTransferred', $5, $6)
+             ON CONFLICT (id) DO NOTHING`,
+            [
+              `${event.id}:UnitTransferred`,
+              event.unitId,
+              event.from,
+              event.to,
+              event.txHash,
+              event.createdAt,
+            ],
           );
           break;
 
@@ -345,6 +466,12 @@ export class PostgresIndexerWriter implements IndexerWriter {
             [event.unitId, event.claimId, event.outcome, event.reportHash, resolvedAt],
           );
           if (event.outcome === "Replaced") {
+            await client.query(
+              `INSERT INTO unit_provenance_edges (id, unit_id, from_node, to_node, transition_type, tx_hash, block_time)
+               VALUES ($1, $2, COALESCE((SELECT owner FROM units WHERE unit_id = $2), ''), 'RETIRED', 'UnitRetired', $3, $4)
+               ON CONFLICT (id) DO NOTHING`,
+              [`${event.id}:UnitRetired`, event.unitId, event.txHash, event.createdAt],
+            );
             await client.query(
               `UPDATE units SET status = 'Retired', updated_at = NOW() WHERE unit_id = $1`,
               [event.unitId],
@@ -374,10 +501,40 @@ export class PostgresIndexerWriter implements IndexerWriter {
 
         case "transfer_offered":
         case "transfer_cancelled":
+        case "passkey_added":
+        case "passkey_removed":
+        case "passkey_rotated":
+        case "recovery_updated":
+          break;
+
+        case "account_deployed":
+          await client.query(
+            `UPDATE passkey_wallets SET deployed = TRUE WHERE wallet_address = $1`,
+            [event.account],
+          );
           break;
       }
 
       await client.query("COMMIT");
+
+      if (this.alerts && (event.type === "batch_recalled" || event.type === "unit_flagged")) {
+        const ctx: AlertContext = {};
+        if (event.type === "batch_recalled") {
+          const dr = await this.pool.query(
+            "SELECT domain FROM brands WHERE address = $1",
+            [event.brand],
+          );
+          ctx.brandDomain = dr.rows[0]?.domain as string | undefined;
+        } else if (event.type === "unit_flagged") {
+          const dr = await this.pool.query(
+            "SELECT b.domain FROM units u JOIN brands b ON u.brand = b.address WHERE u.unit_id = $1",
+            [event.unitId],
+          );
+          ctx.brandDomain = dr.rows[0]?.domain as string | undefined;
+        }
+        await this.alerts.dispatchAlert(event, ctx);
+      }
+
       return { applied: true };
     } catch (err) {
       await client.query("ROLLBACK");
@@ -387,11 +544,60 @@ export class PostgresIndexerWriter implements IndexerWriter {
     }
   }
 
-  async finalizeEventsUpTo(confirmedLedger: number): Promise<number> {
+  /**
+   * Promotes unfinalized events up to `confirmedLedger` using explicit `ledger` bounds
+   * so PostgreSQL partition pruning skips out-of-range `raw_events` partitions.
+   */
+  async finalizeEventsUpTo(confirmedLedger: number, minLedger = 0): Promise<number> {
     const res = await this.pool.query(
-      `UPDATE unit_events SET finalized = TRUE WHERE finalized = FALSE AND ledger <= $1`,
-      [confirmedLedger],
+      `UPDATE unit_events SET finalized = TRUE WHERE finalized = FALSE AND ledger >= $1 AND ledger <= $2`,
+      [minLedger, confirmedLedger],
+    );
+    await this.pool.query(
+      `UPDATE raw_events SET finalized = TRUE WHERE finalized = FALSE AND ledger >= $1 AND ledger <= $2`,
+      [minLedger, confirmedLedger],
     );
     return res.rowCount ?? 0;
+  }
+
+  /**
+   * Queries `raw_events` with explicit `ledger` bounds to guarantee partition pruning.
+   */
+  async getRawEventsInLedgerRange(
+    fromLedger: number,
+    toLedger: number,
+  ): Promise<Array<{ id: string; contract_id: string | null; type: string; ledger: number }>> {
+    const res = await this.pool.query(
+      `SELECT id, contract_id, type, ledger FROM raw_events
+       WHERE ledger >= $1 AND ledger <= $2
+       ORDER BY ledger ASC`,
+      [fromLedger, toLedger],
+    );
+    return res.rows as Array<{
+      id: string;
+      contract_id: string | null;
+      type: string;
+      ledger: number;
+    }>;
+  }
+
+  /**
+   * Creates future 100,000-ledger partitions for `raw_events` and `unit_transfers`.
+   */
+  async ensurePartitionsForLedger(
+    currentLedger: number,
+    lookaheadPartitions = 1,
+    partitionSize = DEFAULT_PARTITION_SIZE,
+  ): Promise<void> {
+    const baseBucket = Math.floor(currentLedger / partitionSize) * partitionSize;
+    for (let i = 0; i <= lookaheadPartitions; i++) {
+      const start = baseBucket + i * partitionSize;
+      const end = start + partitionSize;
+      for (const table of ["raw_events", "unit_transfers"] as const) {
+        await this.pool.query(
+          `CREATE TABLE IF NOT EXISTS ${table}_p${start} PARTITION OF ${table} FOR VALUES FROM (${start}) TO (${end})`,
+        );
+      }
+    }
   }
 }
