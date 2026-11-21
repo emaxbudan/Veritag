@@ -11,16 +11,19 @@
   "scripts": {
     "build": "pnpm -r build",
     "test": "pnpm -r test",
+    "test:coverage": "pnpm -r test -- --coverage --coverage.reporter=lcov --coverage.reporter=text",
     "lint": "pnpm -r lint",
     "typecheck": "pnpm -r typecheck",
     "contract:build": "stellar contract build",
     "contract:test": "cargo test --workspace",
     "contract:bindings": "./scripts/generate-bindings.sh",
     "db:migrate": "pnpm --filter @veritag/backend db:migrate",
-    "seed:demo": "tsx scripts/seed-demo.ts"
+    "seed:demo": "tsx scripts/seed-demo.ts",
+    "accounts:fund": "tsx scripts/fund-testnet-accounts.ts"
   },
   "devDependencies": {
     "@types/node": "^22.13.0",
+    "@vitest/coverage-v8": "^3.0.5",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
     "vitest": "^3.0.5"
