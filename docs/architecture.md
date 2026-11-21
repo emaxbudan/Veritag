@@ -53,3 +53,26 @@ Soroban RPC nodes retain historical events for a bounded retention window. The V
 3. Decodes XDR `ScVal` topics and map payloads produced by `#[contractevent]` into typed TypeScript events.
 4. Applies projections idempotently inside PostgreSQL transactions keyed by event ID (`ON CONFLICT (id) DO NOTHING`).
 5. Tracks confirmation depth (`INDEXER_CONFIRMATION_LEDGERS`) before marking events `finalized = true`.
+
+## Database Partitioning & Vacuuming Maintenance
+
+High-volume event tables (`raw_events` and `unit_transfers`) are range-partitioned on `ledger` in **100,000-ledger** increments (`backend/src/db/schema.sql`). Always include `ledger` bounds (e.g. `WHERE ledger >= $1 AND ledger <= $2`) in analytical or finalization queries so PostgreSQL performs **partition pruning** instead of scanning all partitions.
+
+```bash
+# Apply schema & initial partitions
+pnpm --filter @veritag/backend db:migrate
+
+# Pre-create partitions for current ledger + 2 lookahead ranges (100k ledgers each)
+pnpm --filter @veritag/backend exec tsx src/db/migrate.ts --ensure-partitions --ledger 300000
+
+# Run VACUUM ANALYZE on partitioned event tables
+pnpm --filter @veritag/backend exec tsx src/db/migrate.ts --vacuum
+```
+
+You can verify partition pruning in `psql` with:
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM raw_events
+WHERE ledger >= 100000 AND ledger < 200000;
+```

@@ -76,6 +76,50 @@ CREATE TABLE IF NOT EXISTS unit_events (
 
 CREATE INDEX IF NOT EXISTS idx_unit_events_unit_id ON unit_events(unit_id, ledger ASC);
 
+-- Partitioned high-volume raw event log (100,000 ledgers per range partition)
+CREATE TABLE IF NOT EXISTS raw_events (
+  id TEXT NOT NULL,
+  contract_id TEXT,
+  type TEXT NOT NULL,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  ledger BIGINT NOT NULL,
+  tx_hash TEXT NOT NULL,
+  finalized BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (id, ledger)
+) PARTITION BY RANGE (ledger);
+
+CREATE INDEX IF NOT EXISTS idx_raw_events_ledger ON raw_events (ledger);
+CREATE INDEX IF NOT EXISTS idx_raw_events_contract_ledger ON raw_events (contract_id, ledger);
+
+CREATE TABLE IF NOT EXISTS raw_events_p0
+  PARTITION OF raw_events FOR VALUES FROM (0) TO (100000);
+CREATE TABLE IF NOT EXISTS raw_events_p100000
+  PARTITION OF raw_events FOR VALUES FROM (100000) TO (200000);
+CREATE TABLE IF NOT EXISTS raw_events_default
+  PARTITION OF raw_events DEFAULT;
+
+-- Partitioned unit transfer history (100,000 ledgers per range partition)
+CREATE TABLE IF NOT EXISTS unit_transfers (
+  id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  from_account TEXT NOT NULL,
+  to_account TEXT NOT NULL,
+  ledger BIGINT NOT NULL,
+  tx_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (id, ledger)
+) PARTITION BY RANGE (ledger);
+
+CREATE INDEX IF NOT EXISTS idx_unit_transfers_unit_ledger ON unit_transfers (unit_id, ledger DESC);
+
+CREATE TABLE IF NOT EXISTS unit_transfers_p0
+  PARTITION OF unit_transfers FOR VALUES FROM (0) TO (100000);
+CREATE TABLE IF NOT EXISTS unit_transfers_p100000
+  PARTITION OF unit_transfers FOR VALUES FROM (100000) TO (200000);
+CREATE TABLE IF NOT EXISTS unit_transfers_default
+  PARTITION OF unit_transfers DEFAULT;
+
 CREATE TABLE IF NOT EXISTS claims (
   unit_id TEXT NOT NULL,
   claim_id INTEGER NOT NULL,

@@ -4,10 +4,13 @@ export interface RawSorobanEvent {
   id: string;
   ledger: number;
   txHash: string;
+  contractId?: string;
   ledgerClosedAt?: string;
   topic: ReadonlyArray<xdr.ScVal | string>;
   value: xdr.ScVal | string;
 }
+
+export type ContractKind = "registry" | "account_factory" | "passkey_account";
 
 export type DecodedRegistryEvent =
   | {
@@ -313,4 +316,178 @@ export function decodeRegistryEvent(raw: RawSorobanEvent): DecodedRegistryEvent 
     default:
       return null;
   }
+}
+
+export type DecodedAccountFactoryEvent = {
+  type: "account_deployed";
+  id: string;
+  ledger: number;
+  txHash: string;
+  createdAt: string;
+  contractId?: string;
+  account: string;
+  salt?: string;
+  credentialId?: string;
+};
+
+export type DecodedPasskeyAccountEvent =
+  | {
+      type: "passkey_added";
+      id: string;
+      ledger: number;
+      txHash: string;
+      createdAt: string;
+      contractId?: string;
+      account: string;
+      credentialId: string;
+    }
+  | {
+      type: "passkey_removed";
+      id: string;
+      ledger: number;
+      txHash: string;
+      createdAt: string;
+      contractId?: string;
+      account: string;
+      credentialId: string;
+    }
+  | {
+      type: "passkey_rotated";
+      id: string;
+      ledger: number;
+      txHash: string;
+      createdAt: string;
+      contractId?: string;
+      account: string;
+      oldCredentialId?: string;
+      newCredentialId: string;
+    }
+  | {
+      type: "recovery_updated";
+      id: string;
+      ledger: number;
+      txHash: string;
+      createdAt: string;
+      contractId?: string;
+      account: string;
+      recovery: string;
+    };
+
+export type DecodedEvent =
+  | DecodedRegistryEvent
+  | DecodedAccountFactoryEvent
+  | DecodedPasskeyAccountEvent;
+
+function parseEventParts(raw: RawSorobanEvent) {
+  if (raw.topic.length === 0) return null;
+  const topicsNative = raw.topic.map((t) => scValToNative(toScVal(t)) as unknown);
+  const eventName = String(topicsNative[0] ?? "");
+  const dataVal = scValToNative(toScVal(raw.value)) as Record<string, unknown> | null;
+  const data = dataVal && typeof dataVal === "object" ? dataVal : {};
+  const createdAt = raw.ledgerClosedAt ?? new Date().toISOString();
+  const base = {
+    id: raw.id,
+    ledger: raw.ledger,
+    txHash: raw.txHash,
+    createdAt,
+    ...(raw.contractId ? { contractId: raw.contractId } : {}),
+  };
+  return { topicsNative, eventName, data, base };
+}
+
+export function decodeAccountFactoryEvent(
+  raw: RawSorobanEvent,
+): DecodedAccountFactoryEvent | null {
+  const parts = parseEventParts(raw);
+  if (!parts) return null;
+  const { topicsNative, eventName, data, base } = parts;
+
+  if (eventName === "account_deployed" || eventName === "AccountDeployed") {
+    const account = String(data.account ?? topicsNative[1] ?? "");
+    if (!account) return null;
+    return {
+      ...base,
+      type: "account_deployed",
+      account,
+      ...(data.salt !== undefined ? { salt: asHex(data.salt) } : {}),
+      ...(data.credential_id !== undefined ? { credentialId: asHex(data.credential_id) } : {}),
+    };
+  }
+  return null;
+}
+
+export function decodePasskeyAccountEvent(
+  raw: RawSorobanEvent,
+): DecodedPasskeyAccountEvent | null {
+  const parts = parseEventParts(raw);
+  if (!parts) return null;
+  const { topicsNative, eventName, data, base } = parts;
+  const account = String(data.account ?? raw.contractId ?? "");
+
+  switch (eventName) {
+    case "passkey_added":
+    case "PasskeyAdded":
+      return {
+        ...base,
+        type: "passkey_added",
+        account,
+        credentialId: asHex(data.credential_id ?? topicsNative[1]),
+      };
+    case "passkey_removed":
+    case "PasskeyRemoved":
+      return {
+        ...base,
+        type: "passkey_removed",
+        account,
+        credentialId: asHex(data.credential_id ?? topicsNative[1]),
+      };
+    case "passkey_rotated":
+    case "PasskeyRotated":
+      return {
+        ...base,
+        type: "passkey_rotated",
+        account,
+        ...(data.old_credential_id !== undefined
+          ? { oldCredentialId: asHex(data.old_credential_id) }
+          : {}),
+        newCredentialId: asHex(data.new_credential_id ?? data.credential_id ?? topicsNative[1]),
+      };
+    case "recovery_updated":
+    case "RecoveryUpdated":
+      return {
+        ...base,
+        type: "recovery_updated",
+        account,
+        recovery: String(data.recovery ?? topicsNative[1] ?? ""),
+      };
+    default:
+      return null;
+  }
+}
+
+/**
+ * Dispatches a raw Soroban event to the appropriate contract decoder based on `raw.contractId`
+ * and the configured contract kind registry.
+ */
+export function decodeContractEvent(
+  raw: RawSorobanEvent,
+  contractKinds?: ReadonlyMap<string, ContractKind>,
+): DecodedEvent | null {
+  const kind = raw.contractId ? contractKinds?.get(raw.contractId) : undefined;
+
+  if (kind === "account_factory") {
+    return decodeAccountFactoryEvent(raw);
+  }
+  if (kind === "passkey_account") {
+    return decodePasskeyAccountEvent(raw);
+  }
+  if (kind === "registry") {
+    return decodeRegistryEvent(raw);
+  }
+
+  return (
+    decodeRegistryEvent(raw) ??
+    decodeAccountFactoryEvent(raw) ??
+    decodePasskeyAccountEvent(raw)
+  );
 }

@@ -1,5 +1,9 @@
 import { rpc } from "@stellar/stellar-sdk";
-import { decodeRegistryEvent, type RawSorobanEvent } from "./decoder.js";
+import {
+  decodeContractEvent,
+  type ContractKind,
+  type RawSorobanEvent,
+} from "./decoder.js";
 import type { IndexerWriter } from "./writer.js";
 
 export interface EventPageResponse {
@@ -10,7 +14,8 @@ export interface EventPageResponse {
 
 export interface SorobanEventsProvider {
   fetchEvents(params: {
-    contractId: string;
+    contractId?: string;
+    contractIds?: string[];
     cursor?: string;
     startLedger?: number;
     limit?: number;
@@ -25,21 +30,28 @@ export class RpcEventsProvider implements SorobanEventsProvider {
   }
 
   async fetchEvents(params: {
-    contractId: string;
+    contractId?: string;
+    contractIds?: string[];
     cursor?: string;
     startLedger?: number;
     limit?: number;
   }): Promise<EventPageResponse> {
+    const ids =
+      params.contractIds && params.contractIds.length > 0
+        ? params.contractIds
+        : params.contractId
+          ? [params.contractId]
+          : [];
     const latest = await this.server.getLatestLedger();
     const requestParams: rpc.Server.GetEventsRequest = params.cursor
       ? {
           cursor: params.cursor,
-          filters: [{ type: "contract", contractIds: [params.contractId] }],
+          filters: [{ type: "contract", contractIds: ids }],
           limit: params.limit ?? 100,
         }
       : {
           startLedger: params.startLedger ?? Math.max(1, latest.sequence - 1000),
-          filters: [{ type: "contract", contractIds: [params.contractId] }],
+          filters: [{ type: "contract", contractIds: ids }],
           limit: params.limit ?? 100,
         };
 
@@ -48,6 +60,7 @@ export class RpcEventsProvider implements SorobanEventsProvider {
       id: ev.id,
       ledger: ev.ledger,
       txHash: ev.txHash,
+      ...(ev.contractId ? { contractId: String(ev.contractId) } : {}),
       ledgerClosedAt: ev.ledgerClosedAt,
       topic: ev.topic,
       value: ev.value,
@@ -62,7 +75,9 @@ export class RpcEventsProvider implements SorobanEventsProvider {
 }
 
 export interface IndexerPollerOptions {
-  contractId: string;
+  contractId?: string;
+  contractIds?: string[];
+  contractKinds?: Record<string, ContractKind> | ReadonlyMap<string, ContractKind>;
   provider: SorobanEventsProvider;
   writer: IndexerWriter;
   confirmationLedgers?: number;
@@ -77,7 +92,8 @@ export interface IndexerHealthStatus {
 }
 
 export class IndexerPoller {
-  private readonly contractId: string;
+  private readonly watchedContracts: Set<string>;
+  private readonly contractKinds: Map<string, ContractKind>;
   private readonly provider: SorobanEventsProvider;
   private readonly writer: IndexerWriter;
   private readonly confirmationLedgers: number;
@@ -87,11 +103,33 @@ export class IndexerPoller {
   private lastPollError: string | null = null;
 
   constructor(options: IndexerPollerOptions) {
-    this.contractId = options.contractId;
+    const initialIds =
+      options.contractIds && options.contractIds.length > 0
+        ? options.contractIds
+        : options.contractId
+          ? [options.contractId]
+          : [];
+    this.watchedContracts = new Set(initialIds.filter(Boolean));
+    this.contractKinds =
+      options.contractKinds instanceof Map
+        ? new Map(options.contractKinds)
+        : new Map(Object.entries(options.contractKinds ?? {}));
     this.provider = options.provider;
     this.writer = options.writer;
     this.confirmationLedgers = options.confirmationLedgers ?? 2;
     this.batchLimit = options.batchLimit ?? 100;
+  }
+
+  getWatchedContractIds(): string[] {
+    return Array.from(this.watchedContracts);
+  }
+
+  addWatchedContractId(contractId: string, kind?: ContractKind): void {
+    if (!contractId) return;
+    this.watchedContracts.add(contractId);
+    if (kind) {
+      this.contractKinds.set(contractId, kind);
+    }
   }
 
   /**
@@ -196,8 +234,10 @@ export class IndexerPoller {
     let totalApplied = 0;
 
     while (currentStart <= toLedger) {
+      const contractIds = this.getWatchedContractIds();
       const page = await this.provider.fetchEvents({
-        contractId: this.contractId,
+        contractId: contractIds[0],
+        contractIds,
         cursor,
         startLedger: cursor ? undefined : currentStart,
         limit: this.batchLimit,
@@ -216,8 +256,12 @@ export class IndexerPoller {
         if (rawEv.ledger > toLedger) continue;
         totalFetched++;
 
-        const decoded = decodeRegistryEvent(rawEv);
+        const decoded = decodeContractEvent(rawEv, this.contractKinds);
         if (!decoded) continue;
+
+        if (decoded.type === "account_deployed") {
+          this.addWatchedContractId(decoded.account, "passkey_account");
+        }
 
         const isFinalized = decoded.ledger <= confirmedCutoff;
         const { applied } = await this.writer.applyEvent(decoded, isFinalized);

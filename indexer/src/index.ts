@@ -3,8 +3,37 @@ import { IndexerPoller, RpcEventsProvider } from "./poller.js";
 import { InMemoryIndexerWriter, PostgresIndexerWriter } from "./writer.js";
 
 const rpcUrl = process.env.SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org";
-const contractId =
+const registryContractId =
   process.env.REGISTRY_CONTRACT_ID ?? "CCOY35YSS7ICXGYOSZOF4QXZP5OG2MFSEFXZUYJEFUUXG5HHZ3ZUZQND";
+const accountFactoryContractId = process.env.ACCOUNT_FACTORY_CONTRACT_ID;
+const passkeyAccountContractIds = (process.env.PASSKEY_ACCOUNT_CONTRACT_IDS ?? "")
+  .split(",")
+  .map((id) => id.trim())
+  .filter(Boolean);
+const extraContractIds = (process.env.INDEXER_CONTRACT_IDS ?? "")
+  .split(",")
+  .map((id) => id.trim())
+  .filter(Boolean);
+
+const contractKinds: Record<string, ContractKind> = {
+  [registryContractId]: "registry",
+};
+if (accountFactoryContractId) {
+  contractKinds[accountFactoryContractId] = "account_factory";
+}
+for (const id of passkeyAccountContractIds) {
+  contractKinds[id] = "passkey_account";
+}
+
+const contractIds = Array.from(
+  new Set([
+    registryContractId,
+    ...(accountFactoryContractId ? [accountFactoryContractId] : []),
+    ...passkeyAccountContractIds,
+    ...extraContractIds,
+  ]),
+);
+
 const databaseUrl =
   process.env.DATABASE_URL ?? "postgres://veritag:veritag@localhost:5432/veritag";
 const pollIntervalMs = Number(process.env.INDEXER_POLL_INTERVAL_MS ?? 5000);
@@ -21,7 +50,8 @@ const writer =
 
 const provider = new RpcEventsProvider(rpcUrl);
 const poller = new IndexerPoller({
-  contractId,
+  contractIds,
+  contractKinds,
   provider,
   writer,
   confirmationLedgers,
@@ -70,7 +100,7 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     console.log(
-      `[indexer] Running backfill for ${contractId} from ledger ${args.fromLedger} to ${args.toLedger}...`,
+      `[indexer] Running backfill for ${contractIds.join(", ")} from ledger ${args.fromLedger} to ${args.toLedger}...`,
     );
     const summary = await poller.backfillRange(args.fromLedger, args.toLedger);
     console.log(
